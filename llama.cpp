@@ -290,6 +290,9 @@ enum llm_kv {
     LLM_KV_ROPE_SCALING_ORIG_CTX_LEN,
     LLM_KV_ROPE_SCALING_FINETUNED,
 
+    LLM_KV_SPLIT_NO,
+    LLM_KV_SPLIT_COUNT,
+
     LLM_KV_SSM_INNER_SIZE,
     LLM_KV_SSM_CONV_KERNEL,
     LLM_KV_SSM_STATE_SIZE,
@@ -354,6 +357,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ROPE_SCALING_FACTOR,           "%s.rope.scaling.factor"                  },
     { LLM_KV_ROPE_SCALING_ORIG_CTX_LEN,     "%s.rope.scaling.original_context_length" },
     { LLM_KV_ROPE_SCALING_FINETUNED,        "%s.rope.scaling.finetuned"               },
+
+    { LLM_KV_SPLIT_NO,                      "split.no"    },
+    { LLM_KV_SPLIT_COUNT,                   "split.count" },
 
     { LLM_KV_SSM_CONV_KERNEL,               "%s.ssm.conv_kernel"    },
     { LLM_KV_SSM_INNER_SIZE,                "%s.ssm.inner_size"     },
@@ -2797,6 +2803,9 @@ struct llama_model_loader {
     int n_tensors = 0;
     int n_created = 0;
 
+    uint16_t n_split = 0;
+    std::vector<uint16_t> split_tensor_offsets = {0};
+
     int64_t n_elements = 0;
     size_t  n_bytes    = 0;
 
@@ -2839,6 +2848,55 @@ struct llama_model_loader {
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+        get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
+        if (n_split > 0) {
+            uint16_t i_split = 0;
+            get_key(llm_kv(LLM_KV_SPLIT_NO), i_split);
+            if (i_split != 0) {
+                throw std::runtime_error(format("illegal split file: %d, model must be loaded with the first split", i_split));
+            }
+            char split_prefix[4096] = {0};
+            int n_split_prefix = llama_split_prefix(split_prefix, fname.c_str(), i_split, n_split);
+            if (!n_split_prefix) {
+                throw std::runtime_error(format("invalid split file: %s", fname.c_str()));
+            }
+
+            if (trace > 0) {
+                LLAMA_LOG_INFO("%s: loading additional %d GGUFs split\n",
+                               __func__, n_split);
+            }
+
+            auto split_n_tensors = gguf_get_n_tensors(ctx_gguf);
+            for (i_split = 1; i_split < n_split; i_split++) {
+                char split_path[4096] = {0};
+                llama_split_path(split_path, sizeof(split_path), split_prefix, i_split, n_split);
+
+                struct ggml_context * split_ctx_meta = NULL;
+                struct gguf_init_params split_params = {
+                    /*.no_alloc = */ true,
+                    /*.ctx      = */ &split_ctx_meta,
+                };
+                auto * split_ctx_gguf = gguf_init_from_file(split_path, split_params);
+                if (!split_ctx_gguf) {
+                    throw std::runtime_error(format("%s: failed to load GGUF split from %s\n", __func__, fname.c_str()));
+                }
+
+                split_tensor_offsets.push_back(split_n_tensors);
+                split_n_tensors = gguf_get_n_tensors(split_ctx_gguf);
+                for (int i_tensor = 0; i_tensor < split_n_tensors; i_tensor++) {
+                    const char * t_name = gguf_get_tensor_name(split_ctx_gguf, i_tensor);
+                    struct ggml_tensor * t = ggml_get_tensor(split_ctx_meta, t_name);
+                    gguf_add_tensor(ctx_gguf, t);
+                }
+
+                gguf_free(split_ctx_gguf);
+                ggml_free(split_ctx_meta);
+            }
+
+            LLAMA_LOG_INFO("%s: additional %d GGUFs split metadata loaded.\n",
+                           __func__, n_split);
+        }
 
         n_kv      = gguf_get_n_kv(ctx_gguf);
         n_tensors = gguf_get_n_tensors(ctx_gguf);
@@ -14646,6 +14704,32 @@ LLAMA_API int32_t llama_chat_apply_template(
         strncpy(buf, formatted_chat.c_str(), length);
     }
     return res;
+}
+
+LLAMA_API int llama_split_path(char * split_path, int maxlen, const char * path_prefix, int split_no, int split_count) {
+    static const char * const SPLIT_PATH_FORMAT = "%s-%05d-of-%05d.gguf";
+    if (snprintf(split_path, maxlen, SPLIT_PATH_FORMAT, path_prefix, split_no + 1, split_count)) {
+        return strlen(split_path);
+    }
+    return 0;
+}
+
+LLAMA_API int llama_split_prefix(char * dest, const char * split_path, int split_no, int split_count) {
+    char split_prefix[PATH_MAX] = {0};
+    int split_no_file = 0;
+    int split_count_file = 0;
+    const char * split_format = "-00000-of-00000.gguf";
+
+    if (strlen(split_path) > strlen(split_format) + 1) {
+        strncpy(split_prefix, split_path, strlen(split_path) - strlen(split_format));
+
+        int n = sscanf(&split_path[0] + strlen(split_prefix), "-%d-of-%d", &split_no_file, &split_count_file);
+        if (n == 2 && split_no_file - 1 == split_no && split_count_file == split_count) {
+            strcpy(dest, split_prefix);
+            return strlen(split_prefix);
+        }
+    }
+    return 0;
 }
 
 struct llama_timings llama_get_timings(struct llama_context * ctx) {
