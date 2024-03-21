@@ -3199,6 +3199,9 @@ struct llama_model_loader {
         *addr = mapping->addr;
         for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
             const auto & w = get_weights(ggml_get_name(tensor));
+            if (w.idx != idx) {
+                continue;
+            }
             *first = std::min(*first, w.offs);
             *last  = std::max(*last, w.offs + ggml_nbytes(tensor));
         }
@@ -5143,6 +5146,9 @@ static bool llm_load_tensors(
                 void * addr = nullptr;
                 size_t first, last;
                 ml.get_mapping_range(&first, &last, &addr, file_no, ctx);
+                if (first >= last) {
+                    continue;
+                }
                 ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr((char *)addr + first, last - first);
                 if (buf != nullptr) {
                     bufs.emplace(file_no, buf);
@@ -5163,6 +5169,9 @@ static bool llm_load_tensors(
                 void * addr = nullptr;
                 size_t first, last;
                 ml.get_mapping_range(&first, &last, &addr, file_no, ctx);
+                if (first >= last) {
+                    continue;
+                }
                 ggml_backend_buffer_t buf = ggml_backend_metal_buffer_from_ptr((char *) addr + first, last - first, max_size);
                 if (buf != nullptr) {
                     bufs.emplace(file_no, buf);
